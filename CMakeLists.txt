@@ -1,36 +1,42 @@
-cmake_minimum_required(VERSION 3.13)
-# initialize the SDK based on PICO_SDK_PATH
-# note: this must happen before project()
-include(pico_sdk_import.cmake)
-project(tamarin_firmware)
- 
+# Set minimum required version of CMake
+cmake_minimum_required(VERSION 3.12)
+
+# Include build functions from Pico SDK
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+
+# Set name of project (as PROJECT_NAME) and C/C++ standards
+project(picoDFU C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -ggdb")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
+
+# Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
 
-add_executable(tamarin_firmware)
+add_executable(${PROJECT_NAME} 
+    main.c
+    ${SOURCES}
+)
 
-# target_compile_definitions(tamarin_firmware
-#   PUBLIC PICO_UART_ENABLE_CRLF_SUPPORT=0
-#   PUBLIC PICO_STDIO_ENABLE_CRLF_SUPPORT=0
-#   PUBLIC PICO_STDIO_DEFAULT_CRLF=0
-# )
+pico_generate_pio_header(picoDFU ${CMAKE_CURRENT_LIST_DIR}/lightning_rx.pio)
+pico_generate_pio_header(picoDFU ${CMAKE_CURRENT_LIST_DIR}/lightning_tx.pio)
 
-pico_generate_pio_header(tamarin_firmware ${CMAKE_CURRENT_LIST_DIR}/lightning_tx.pio)
-pico_generate_pio_header(tamarin_firmware ${CMAKE_CURRENT_LIST_DIR}/lightning_rx.pio)
-pico_generate_pio_header(tamarin_firmware ${CMAKE_CURRENT_LIST_DIR}/probe.pio)
+target_include_directories(${PROJECT_NAME} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
-# Required so the build finds tusb_config.h
-target_include_directories(tamarin_firmware PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+# Create map/bin/hex/uf2 files
+pico_add_extra_outputs(${PROJECT_NAME})
 
-target_sources(tamarin_firmware PRIVATE
-        tamarin_probe.c
-        main.c
-        usb_descriptors.c
-        util.c
-        )
+# Link to pico_stdlib (gpio, time, etc. functions)
+target_link_libraries(${PROJECT_NAME} 
+    pico_stdlib
+    hardware_pio
+    pico_multicore
+)
 
-target_link_libraries(tamarin_firmware PRIVATE pico_stdlib tinyusb_device tinyusb_board pico_stdio hardware_i2c pico_multicore pico_time pico_sync hardware_pio)
-pico_add_extra_outputs(tamarin_firmware)
-
-# enable usb output, disable uart output
-#pico_enable_stdio_usb(tamarin_firmware 1)
-#pico_enable_stdio_uart(tamarin_firmware 0)
+# Enable usb output, disable uart output
+pico_enable_stdio_usb(${PROJECT_NAME} 0)
+pico_enable_stdio_uart(${PROJECT_NAME} 1)

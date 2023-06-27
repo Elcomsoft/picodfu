@@ -13,51 +13,75 @@
 #include "hardware/uart.h"
 #include "hardware/timer.h"
 #include "hardware/watchdog.h"
+#include "hardware/sync.h"
+#include "hardware/structs/ioqspi.h"
+#include "hardware/structs/sio.h"
 
 #include "lightning_rx.pio.h"
 #include "lightning_tx.pio.h"
 
-#include "bsp/board.h"
-#include "tusb.h"
+#define PIN_ID0 3
+#define PIN_ID1 2
+const uint led_pin = 25;
 
-#include "tamarin_probe.h"
-#include "util.h"
+bool __no_inline_not_in_flash_func(get_bootsel_button)() {
+    const uint CS_PIN_INDEX = 1;
 
-#define PIN_SDQ 3
+    // Must disable interrupts, as interrupt handlers may be in flash, and we
+    // are about to temporarily disable flash access!
+    uint32_t flags = save_and_disable_interrupts();
 
-volatile bool serialEnabled = false;
+    // Set chip select to Hi-Z
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
 
-void configure_rx(PIO pio, uint sm) {
+    // Note we can't call into any sleep functions in flash right now
+    for (volatile int i = 0; i < 1000; ++i);
+
+    // The HI GPIO registers in SIO can observe and control the 6 QSPI pins.
+    // Note the button pulls the pin *low* when pressed.
+    bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+
+    // Need to restore the state of chip select, else we are going to have a
+    // bad time when we return to code in flash!
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    restore_interrupts(flags);
+
+    return button_state;
+}
+
+void configure_rx_internal(PIO pio, uint sm, int pin_sdq) {
     pio_sm_set_enabled(pio, sm, false);
     pio_clear_instruction_memory(pio);
     uint offset = pio_add_program(pio, &lightning_rx_program);
-    pio_sm_config c = lightning_rx_program_init(pio, sm, offset, PIN_SDQ, 125.0/2.0);
+    pio_sm_config c = lightning_rx_program_init(pio, sm, offset, pin_sdq, 125.0/2.0);
 }
 
-void leave_dcsd() {
-    uart_deinit(uart0);
-    serialEnabled = false;
+void configure_rx(PIO pio) {
+    configure_rx_internal(pio, 0, PIN_ID0);
+    configure_rx_internal(pio, 1, PIN_ID1);
 }
 
-void lightning_send_wake() {
-    gpio_init(PIN_SDQ);
-    gpio_set_dir(PIN_SDQ, GPIO_OUT);
-    gpio_put(PIN_SDQ, 0);
+void lightning_send_wake(int pid_sdq) {
+    gpio_init(pid_sdq);
+    gpio_set_dir(pid_sdq, GPIO_OUT);
+    gpio_put(pid_sdq, 0);
     
     sleep_us(20);
     
-    gpio_set_dir(PIN_SDQ, GPIO_IN);
+    gpio_set_dir(pid_sdq, GPIO_IN);
     
     sleep_us(1000);
 }
 
-void tamarin_reset_tristar(PIO pio, uint sm) {
-    tamarin_probe_deinit();
-    leave_dcsd();
-    
-    lightning_send_wake();
-    
-    configure_rx(pio, sm);
+void tamarin_reset_tristar(PIO pio) {
+    lightning_send_wake(PIN_ID0);    
+    lightning_send_wake(PIN_ID1);    
+    configure_rx(pio);
 }
 
 unsigned char reverse_byte(unsigned char b) {
@@ -122,43 +146,21 @@ const uint8_t bootloader_response[RSP_MAX][8] = {
     [RSP_DFU] = {0x75, 0x20, 0x00, 0x02, 0x00, 0x00, 0x00, 0xad},
 };
 
+void set_idbus_high_impedance_internal(int pin_sdq) {
+    gpio_pull_up (pin_sdq);
+    gpio_init(pin_sdq);
+    gpio_set_dir(pin_sdq, GPIO_IN);
+}
 void set_idbus_high_impedance() {
-    gpio_pull_up (PIN_SDQ);
-    gpio_init(PIN_SDQ);
-    gpio_set_dir(PIN_SDQ, GPIO_IN);
+    set_idbus_high_impedance_internal(PIN_ID0);
+    set_idbus_high_impedance_internal(PIN_ID1);
 }
 
-#define DCSD_UART uart0
-#define DCSD_TX_PIN 0
-#define DCSD_RX_PIN 1
-
-void dcsd_mode(PIO pio, uint sm) {
-    uart_init(uart0, 115200);
-    gpio_set_function(DCSD_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(DCSD_RX_PIN, GPIO_FUNC_UART);
-
-    serprint("DCSD mode active.\r\n");
-    serprint("Connect to the second serial port of the\r\n");
-    serprint("Tamarin Cable to access the monitor.\r\n");
-    
-    serialEnabled = true;
-}
-
-void jtag_mode(PIO pio, uint sm) {
-    set_idbus_high_impedance();
-    pio_sm_set_enabled(pio, sm, false);
-    tamarin_probe_init();
-    serprint("JTAG mode active, ID pin in Hi-Z.\r\n");
-    serprint("You can now connect with an SWD debugger.\r\n");
-    serprint("Please note: Reset/Reset to DFU will be unavailable until\r\n");
-    serprint("the device is rebooted or the cable is re-plugged.\r\n");
-}
-
-void respond_lightning(PIO pio, uint sm, const uint8_t *data, size_t data_length) {
+void respond_lightning_internal(PIO pio, uint sm, int pin_sdq, const uint8_t *data, size_t data_length) {
     pio_sm_set_enabled(pio, sm, false);
     pio_clear_instruction_memory(pio);
     uint offset = pio_add_program(pio, &lightning_tx_program);
-    pio_sm_config c = lightning_tx_program_init(pio, sm, offset, PIN_SDQ, 125.0/2.0);
+    lightning_tx_program_init(pio, sm, offset, pin_sdq, 125.0/2.0);
     for(size_t i=0; i < data_length; i++) {
         pio_sm_put_blocking(pio, sm, data[i]);
     }
@@ -167,52 +169,97 @@ void respond_lightning(PIO pio, uint sm, const uint8_t *data, size_t data_length
     }
 }
 
+void respond_lightning(PIO pio, const uint8_t *data, size_t data_length) {
+    respond_lightning_internal(pio, 0, PIN_ID0, data, data_length);
+    respond_lightning_internal(pio, 1, PIN_ID1, data, data_length);
+}
+
+void set_dfu(){
+    printf("Called set_DFU!\n");
+    gCommand = CMD_AUTO_DFU;
+    gState = RESTART_ENUMERATION;
+}
+
+void set_reset(){
+    printf("Called set_DFU!\n");
+    gCommand = CMD_RESET;
+    gState = RESTART_ENUMERATION;
+}
+
+int buttonCNT = 0;
+
 void output_state_machine() {
     PIO pio = pio1;
-    uint sm = pio_claim_unused_sm(pio, true);
 
     uint8_t i = 0;
     uint8_t buf[4];
 
     uint32_t value, value_b;
     while(1) {
+        if (get_bootsel_button()){
+            if (++buttonCNT == 5){
+                set_reset();
+                buttonCNT = 0;
+                for (size_t i = 0; i < 10; i++) {
+                    gpio_put(led_pin, 0);
+                    sleep_ms(100);
+                    gpio_put(led_pin, 1);
+                    sleep_ms(100);
+                }                
+            }else{
+                set_dfu();
+                gpio_put(led_pin, 0);
+                sleep_ms(1000);
+                gpio_put(led_pin, 1);
+            }
+        }
         switch(gState) {
             case RESTART_ENUMERATION:
-                serprint("Restarting enumeration!\r\n");
-                tamarin_reset_tristar(pio, sm);
-                serprint("Done restarting enumeration!\r\n");
+                gpio_put(led_pin, 0);
+                printf("Restarting enumeration!\r\n");
+                tamarin_reset_tristar(pio);
+                printf("Done restarting enumeration!\r\n");
                 gState = WAITING_FOR_INIT;
                 break;
                 
             case WAITING_FOR_INIT:
-                if (pio_sm_is_rx_fifo_empty(pio, sm)) break;
-                value = pio_sm_get_blocking(pio, sm);
-                value_b = reverse_byte(value & 0xFF);
+                gpio_put(led_pin, 1);
+                for (uint8_t sm = 0; sm < 2; sm++){
+                    if (pio_sm_is_rx_fifo_empty(pio, sm)) continue;
+                    value = pio_sm_get_blocking(pio, sm);
+                    value_b = reverse_byte(value & 0xFF);
+                    gpio_put(led_pin, 0);
 
-                if(value_b == 0x74) {
-                    leave_dcsd();
-                    gState = READING_TRISTAR_REQUEST;
-                    buf[0] = value_b;
-                    i = 1;
-                } else {
-                    serprint("Tristar >> 0x%x (unknown, ignoring)\r\n", value_b);
+                    if(value_b == 0x74) {
+                        gState = READING_TRISTAR_REQUEST;
+                        buf[0] = value_b;
+                        i = 1;
+                    } else {
+                        printf("Tristar >> 0x%x (unknown, ignoring)\r\n", value_b);
+                    }                    
+
+                    sleep_us(100); // Breaks without this...
+                    break;
                 }
-                
-                sleep_us(100); // Breaks without this...
                 
                 break;
             case READING_TRISTAR_REQUEST:
-                if (pio_sm_is_rx_fifo_empty(pio, sm)) break;
-                value = pio_sm_get_blocking(pio, sm);
-                value_b = reverse_byte(value & 0xFF);
+                for (uint8_t sm = 0; sm < 2; sm++){
+                    if (pio_sm_is_rx_fifo_empty(pio, sm)) continue;
+                    value = pio_sm_get_blocking(pio, sm);
+                    value_b = reverse_byte(value & 0xFF);
 
-                buf[i++] = value_b;
-                if(i == 4) {
-                    gState = HANDLE_TRISTAR_REQUEST;
-                    i = 0;
+                    gpio_put(led_pin, 0);
+
+                    buf[i++] = value_b;
+                    if(i == 4) {
+                        gState = HANDLE_TRISTAR_REQUEST;
+                        i = 0;
+                    }
+                    
+                    sleep_us(100); // Breaks without this...
+                    break;
                 }
-                
-                sleep_us(100); // Breaks without this...
                 
                 break;
             case HANDLE_TRISTAR_REQUEST:
@@ -220,128 +267,65 @@ void output_state_machine() {
                     case CMD_DEFAULT:
                         switch (gDefaultCommand) {
                             case DEFAULT_CMD_DCSD:
-                                respond_lightning(pio, sm, bootloader_response[RSP_USB_UART], 8);
-                                dcsd_mode(pio, sm);
+                                respond_lightning(pio, bootloader_response[RSP_USB_UART], 8);
                                 break;
                                 
                             case DEFAULT_CMD_JTAG:
-                                respond_lightning(pio, sm, bootloader_response[RSP_USB_UART_JTAG], 8);
+                                respond_lightning(pio, bootloader_response[RSP_USB_UART_JTAG], 8);
                                 gState = FORCE_JTAG;
                                 continue;
                         }
                         break;
                     case CMD_RESET:
-                        respond_lightning(pio, sm, bootloader_response[RSP_RESET], 8);
+                        respond_lightning(pio, bootloader_response[RSP_RESET], 8);
+                        gpio_put(led_pin, 0);
                         sleep_us(1000);
                         gCommand = CMD_DEFAULT;
                         break;
                     case CMD_AUTO_DFU:
-                        respond_lightning(pio, sm, bootloader_response[RSP_RESET], 8);
+                        respond_lightning(pio, bootloader_response[RSP_RESET], 8);
                         // Measured with logic analyzer
+                        gpio_put(led_pin, 0);
                         sleep_us(900);
                         gCommand = CMD_INTERNAL_AUTO_DFU_2;
                         break;
                     case CMD_INTERNAL_AUTO_DFU_2:
-                        respond_lightning(pio, sm, bootloader_response[RSP_DFU], 8);
-                        serprint("Device should now be in DFU mode.\r\n");
+                        respond_lightning(pio, bootloader_response[RSP_DFU], 8);
+                        printf("Device should now be in DFU mode.\r\n");
+                        for (size_t i = 0; i < 3; i++) {
+                            gpio_put(led_pin, 0);
+                            sleep_ms(200);
+                            gpio_put(led_pin, 1);
+                            sleep_ms(200);
+                        }    
                         break;
                     default:
-                        serprint("UNKNOWN MODE. Send help. Locking up.\r\n");
+                        printf("UNKNOWN MODE. Send help. Locking up.\r\n");
                         while(1) {}
                         break;
                 }
                 
                 gState = WAITING_FOR_INIT;
-                configure_rx(pio, sm);
+                configure_rx(pio);
                 break;
                 
-            case HANDLE_JTAG:
-                tamarin_probe_task();
-                break;
-                
-            case FORCE_JTAG:
-                jtag_mode(pio, sm);
-                dcsd_mode(pio, sm); // Also init serial
-                gState = HANDLE_JTAG;
-                break;
-        }
-    }
-}
-
-void print_menu() {
-    serprint("Good morning!\r\n\r\n");
-    serprint("1: JTAG mode\r\n");
-    serprint("2: DCSD mode\r\n");
-    serprint("3: Reset device\r\n");
-    serprint("4: Reset and enter DFU mode\r\n");
-    serprint("F: Force JTAG mode without sending command\r\n");
-    serprint("R: Reset Tamarin cable\r\n");
-    serprint("> ");
-}
-
-void shell_task() {
-    if (tud_cdc_n_available(ITF_CONSOLE)) {
-        char c = tud_cdc_n_read_char(ITF_CONSOLE);
-        switch(c) {
-            case '1':
-                serprint("\r\nEnabling JTAG mode.\r\n");
-                gCommand = CMD_DEFAULT;
-                gDefaultCommand = DEFAULT_CMD_JTAG;
-                gState = RESTART_ENUMERATION;
-                break;
-            case '2':
-                serprint("\r\nEnabling DCSD mode.\r\n");
-                gCommand = CMD_DEFAULT;
-                gDefaultCommand = DEFAULT_CMD_DCSD;
-                gState = RESTART_ENUMERATION;
-                break;
-            case '3':
-                serprint("\r\nResetting.\r\n");
-                gCommand = CMD_RESET;
-                gState = RESTART_ENUMERATION;
-                break;
-            case '4':
-                serprint("\r\nEnabling DFU mode.\r\n");
-                gCommand = CMD_AUTO_DFU;
-                gState = RESTART_ENUMERATION;
-                break;
-            case 'f':
-            case 'F':
-                serprint("\r\nForcing JTAG mode.\r\n");
-                gDefaultCommand = DEFAULT_CMD_JTAG;
-                gState = FORCE_JTAG;
-                break;
-            case 'R':
-            case 'r':
-                watchdog_enable(100, 1);
-                break;
             default:
-                print_menu();
+                printf("UNEXPECTED STATE!!!\n");
                 break;
         }
     }
 }
 
 int main() {
-    board_init();
-    tusb_init();
+    stdio_init_all();
+    // Initialize LED pin
+    gpio_init(led_pin);
+    gpio_set_dir(led_pin, GPIO_OUT);
 
-    multicore_launch_core1(output_state_machine);
-    
-    while(1) {
-        tud_task();
-        shell_task();
-        
-        // Handle serial
-        if (serialEnabled) {
-            if (uart_is_readable(uart0)) {
-                tud_cdc_n_write_char(ITF_DCSD, uart_getc(uart0));
-                tud_cdc_n_write_flush(ITF_DCSD);
-            }
-            
-            if (tud_cdc_n_available(ITF_DCSD)) {
-                uart_putc_raw(uart0, tud_cdc_n_read_char(ITF_DCSD));
-            }
-        }
-    }
+    printf("Init");
+
+    set_dfu();
+    // set_reset();
+
+    output_state_machine();
 }
